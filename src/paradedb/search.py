@@ -26,37 +26,61 @@ from django.db.models.expressions import Expression
 from django.db.models.lookups import Exact
 from django.db.models.sql.compiler import SQLCompiler
 
-PQOperator = Literal["OR", "AND"]
 ParadeOperator = Literal["OR", "AND"]
 _DEFAULT_OPERATOR = object()
 
 
 # Regex to detect simple PostgreSQL identifiers (no quoting needed) vs complex ones.
-# Simple identifiers can be used directly as `pdb.name`, while complex identifiers
-# require pg_sql.Identifier quoting to prevent SQL injection. Using a whitelist of
-# ParadeDB tokenizers would require constant updates as new features launch.
+# Simple identifiers can be used directly as `pdb.name`. We also support tokenizer
+# invocation syntax such as `whitespace('lowercase=false')`.
 _SIMPLE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TOKENIZER_CALL_RE = re.compile(
+    r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\((?P<args>.*)\)$", re.DOTALL
+)
+# Tokenizer args must be SQL string literals: 'k=v'[, 'k=v', ...]
+_TOKENIZER_CALL_ARGS_RE = re.compile(
+    r"^\s*(?:'(?:[^']|'')*'\s*(?:,\s*'(?:[^']|'')*'\s*)*)?$"
+)
 
 
 def _tokenizer_cast(name: str) -> str:
-    """Return ``::pdb.<name>`` using quoting only when the name is not a plain identifier."""
+    """Return safe ``pdb.<tokenizer>`` SQL for tokenizer casts.
+
+    Supported forms:
+    - ``tokenizer``
+    - ``tokenizer('k=v')``
+    - ``tokenizer('k=v', 'k2=v2')``
+
+    Any other form is treated as an identifier and quoted to avoid injection.
+    """
     if _SIMPLE_IDENTIFIER_RE.match(name):
         return f"pdb.{name}"
+
+    tokenizer_call = _TOKENIZER_CALL_RE.match(name)
+    if tokenizer_call is not None:
+        tokenizer_name = tokenizer_call.group("name")
+        tokenizer_args = tokenizer_call.group("args")
+        if _TOKENIZER_CALL_ARGS_RE.match(tokenizer_args):
+            return f"pdb.{tokenizer_name}({tokenizer_args.strip()})"
+
     escaped = name.replace('"', '""')
     return f'pdb."{escaped}"'
 
 
-@dataclass(frozen=True)
-class Fuzzy:
-    """Fuzzy options for Match/Term queries."""
+def _is_fuzzy_enabled(
+    *,
+    distance: int | None,
+    prefix: bool,
+    transposition_cost_one: bool,
+) -> bool:
+    return distance is not None or prefix or transposition_cost_one
 
-    distance: int = 1
-    prefix: bool = False
-    transposition_cost_one: bool = False
 
-    def __post_init__(self) -> None:
-        if self.distance < 0 or self.distance > 2:
-            raise ValueError("Distance must be between 0 and 2, inclusive.")
+def _validate_fuzzy_distance(distance: int | None) -> None:
+    if distance is None:
+        return
+    if distance < 0 or distance > 2:
+        raise ValueError("Distance must be between 0 and 2, inclusive.")
 
 
 @dataclass(frozen=True)
@@ -272,9 +296,16 @@ class Term:
     """Term query expression."""
 
     text: str
-    fuzzy: Fuzzy | None = None
+    distance: int | None = None
+    prefix: bool = False
+    transposition_cost_one: bool = False
     boost: float | None = None
     const: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("Term text must be a string.")
+        _validate_fuzzy_distance(self.distance)
 
 
 @dataclass(frozen=True)
@@ -298,7 +329,9 @@ class Match:
     terms: tuple[str, ...]
     operator: ParadeOperator
     tokenizer: str | None = None
-    fuzzy: Fuzzy | None = None
+    distance: int | None = None
+    prefix: bool = False
+    transposition_cost_one: bool = False
     boost: float | None = None
     const: float | None = None
 
@@ -307,7 +340,9 @@ class Match:
         *terms: str,
         operator: ParadeOperator,
         tokenizer: str | None = None,
-        fuzzy: Fuzzy | None = None,
+        distance: int | None = None,
+        prefix: bool = False,
+        transposition_cost_one: bool = False,
         boost: float | None = None,
         const: float | None = None,
     ) -> None:
@@ -315,10 +350,19 @@ class Match:
             raise ValueError("Match requires at least one search term.")
         if operator not in ("AND", "OR"):
             raise ValueError("Match operator must be 'AND' or 'OR'.")
+        if not all(isinstance(term, str) for term in terms):
+            raise TypeError("Match terms must be strings.")
+        if tokenizer is not None and not isinstance(tokenizer, str):
+            raise TypeError("Match tokenizer must be a string.")
+
+        _validate_fuzzy_distance(distance)
+
         object.__setattr__(self, "terms", tuple(terms))
         object.__setattr__(self, "operator", operator)
         object.__setattr__(self, "tokenizer", tokenizer)
-        object.__setattr__(self, "fuzzy", fuzzy)
+        object.__setattr__(self, "distance", distance)
+        object.__setattr__(self, "prefix", prefix)
+        object.__setattr__(self, "transposition_cost_one", transposition_cost_one)
         object.__setattr__(self, "boost", boost)
         object.__setattr__(self, "const", const)
 
@@ -571,43 +615,6 @@ class MoreLikeThis(Expression):
         return ", " + ", ".join(rendered), params
 
 
-@dataclass(frozen=True)
-class PQ:
-    """Query object for ParadeDB boolean logic."""
-
-    terms: tuple[str, ...]
-    operator: PQOperator | None = None
-
-    def __init__(self, term: str) -> None:
-        object.__setattr__(self, "terms", (term,))
-        object.__setattr__(self, "operator", None)
-
-    def __or__(self, other: PQ) -> PQ:
-        return self._combine("OR", other)
-
-    def __and__(self, other: PQ) -> PQ:
-        return self._combine("AND", other)
-
-    def _combine(self, operator: PQOperator, other: PQ) -> PQ:
-        if not isinstance(other, PQ):
-            raise TypeError("PQ objects can only be combined with PQ instances.")
-
-        if self.operator not in (None, operator):
-            raise ValueError("Mixed PQ operators are not supported yet.")
-        if other.operator not in (None, operator):
-            raise ValueError("Mixed PQ operators are not supported yet.")
-
-        terms = (*self.terms, *other.terms)
-        return PQ._from_terms(terms, operator)
-
-    @classmethod
-    def _from_terms(cls, terms: Iterable[str], operator: PQOperator) -> PQ:
-        instance = cls.__new__(cls)
-        object.__setattr__(instance, "terms", tuple(terms))
-        object.__setattr__(instance, "operator", operator)
-        return instance
-
-
 class ParadeDB:
     """Wrapper for ParadeDB search terms.
 
@@ -615,9 +622,8 @@ class ParadeDB:
         # Explicit literal match query
         ParadeDB(Match('running', 'shoes', operator='AND'))
 
-        # Boolean logic (PQ must be SOLE argument)
-        ParadeDB(PQ('shoes') | PQ('boots'))  # ✅ Valid
-        ParadeDB(PQ('a'), 'b')               # ❌ Error - PQ must be alone
+        # Complex mixed AND/OR logic is expressed by combining multiple
+        # ParadeDB(Match(...)) clauses with Django Q objects.
 
         # Query expressions (SINGLE expression only)
         ParadeDB(Parse('query'))             # ✅ Valid
@@ -628,16 +634,9 @@ class ParadeDB:
         ParadeDB(Phrase('a'), Phrase('b'))   # ✅ Valid
         ParadeDB(Phrase('a'), 'b')           # ❌ Error - no mixing
 
-        # Important: Match(..., operator='OR') and PQ(... | ...) are not equivalent.
-        # Match(..., operator='OR') sends the raw string to ParadeDB
-        # (e.g. ||| 'running shoes'),
-        # which is tokenized using the column's configured tokenizer.
-        # PQ('running') | PQ('shoes') emits ||| ARRAY['running', 'shoes'],
-        # which bypasses tokenizer-based splitting.
-
     Raises:
-        ValueError: If PQ is mixed with other terms, or Parse/Term/Regex/All
-            is not provided as a single term, or operator is passed with
+        ValueError: If Parse/Term/Regex/All is not provided as a single term,
+            or operator is passed with
             non-string query expressions
         TypeError: If query term types are mixed
     """
@@ -649,11 +648,6 @@ class ParadeDB:
     @overload
     def __init__(self, __match: Match, *, operator: object = _DEFAULT_OPERATOR) -> None:
         """Explicit literal search with required Match operator."""
-        ...
-
-    @overload
-    def __init__(self, __pq: PQ, *, operator: None = None) -> None:
-        """Boolean logic with PQ object (must be sole argument)."""
         ...
 
     @overload
@@ -692,7 +686,6 @@ class ParadeDB:
         self,
         *terms: str
         | Match
-        | PQ
         | Phrase
         | Proximity
         | Parse
@@ -713,7 +706,9 @@ class ParadeDB:
             raise ValueError("ParadeDB requires at least one search term.")
         self._terms = terms
         self._tokenizer = tokenizer
-        self._fuzzy: Fuzzy | None = None
+        self._distance: int | None = None
+        self._prefix = False
+        self._transposition_cost_one = False
         self._boost = boost
         self._const = const
         self._operator: ParadeOperator = "AND"
@@ -730,8 +725,7 @@ class ParadeDB:
         if self._tokenizer is not None and any(
             isinstance(
                 term,
-                PQ
-                | Phrase
+                Phrase
                 | Proximity
                 | Parse
                 | PhrasePrefix
@@ -751,8 +745,7 @@ class ParadeDB:
         if self._boost is not None and any(
             isinstance(
                 term,
-                PQ
-                | Phrase
+                Phrase
                 | Proximity
                 | Parse
                 | PhrasePrefix
@@ -772,8 +765,7 @@ class ParadeDB:
         if self._const is not None and any(
             isinstance(
                 term,
-                PQ
-                | Phrase
+                Phrase
                 | Proximity
                 | Parse
                 | PhrasePrefix
@@ -850,14 +842,6 @@ class ParadeDB:
             ...,
         ],
     ]:
-        if len(self._terms) == 1 and isinstance(self._terms[0], PQ):
-            pq = self._terms[0]
-            operator = "|||" if pq.operator == "OR" else "&&&"
-            return operator, pq.terms
-
-        if any(isinstance(term, PQ) for term in self._terms):
-            raise ValueError("PQ objects must be provided as the sole ParadeDB input.")
-
         if any(
             isinstance(
                 term,
@@ -908,7 +892,9 @@ class ParadeDB:
             else:
                 raise ValueError("Match operator must be 'AND' or 'OR'.")
             self._tokenizer = term.tokenizer
-            self._fuzzy = term.fuzzy
+            self._distance = term.distance
+            self._prefix = term.prefix
+            self._transposition_cost_one = term.transposition_cost_one
             self._boost = term.boost
             self._const = term.const
             return operator, term.terms
@@ -967,13 +953,25 @@ class ParadeDB:
         return sql
 
     @staticmethod
-    def _append_fuzzy(sql: str, fuzzy: Fuzzy | None) -> str:
-        if fuzzy is None:
+    def _append_fuzzy(
+        sql: str,
+        *,
+        distance: int | None,
+        prefix: bool,
+        transposition_cost_one: bool,
+    ) -> str:
+        if not _is_fuzzy_enabled(
+            distance=distance,
+            prefix=prefix,
+            transposition_cost_one=transposition_cost_one,
+        ):
             return sql
-        fuzzy_args: list[str] = [str(fuzzy.distance)]
-        if fuzzy.transposition_cost_one:
-            fuzzy_args.extend(["t" if fuzzy.prefix else "f", "t"])
-        elif fuzzy.prefix:
+
+        fuzzy_distance = 1 if distance is None else distance
+        fuzzy_args: list[str] = [str(fuzzy_distance)]
+        if transposition_cost_one:
+            fuzzy_args.extend(["t" if prefix else "f", "t"])
+        elif prefix:
             fuzzy_args.append("t")
         return f"{sql}::pdb.fuzzy({', '.join(fuzzy_args)})"
 
@@ -1074,8 +1072,20 @@ class ParadeDB:
             return self._append_scoring(rendered, boost=term.boost, const=term.const)
         if isinstance(term, Term):
             rendered = f"pdb.term({self._quote_term(term.text)})"
-            rendered = self._append_fuzzy(rendered, term.fuzzy)
-            if term.fuzzy is not None and term.const is not None:
+            rendered = self._append_fuzzy(
+                rendered,
+                distance=term.distance,
+                prefix=term.prefix,
+                transposition_cost_one=term.transposition_cost_one,
+            )
+            if (
+                _is_fuzzy_enabled(
+                    distance=term.distance,
+                    prefix=term.prefix,
+                    transposition_cost_one=term.transposition_cost_one,
+                )
+                and term.const is not None
+            ):
                 # pdb.fuzzy has no direct cast to pdb.const; bridge via pdb.query.
                 rendered = f"{rendered}::pdb.query"
             return self._append_scoring(rendered, boost=term.boost, const=term.const)
@@ -1085,8 +1095,20 @@ class ParadeDB:
         if isinstance(term, All):
             return "pdb.all()"
         rendered = self._quote_term(term)
-        rendered = self._append_fuzzy(rendered, self._fuzzy)
-        if self._fuzzy is not None and self._const is not None:
+        rendered = self._append_fuzzy(
+            rendered,
+            distance=self._distance,
+            prefix=self._prefix,
+            transposition_cost_one=self._transposition_cost_one,
+        )
+        if (
+            _is_fuzzy_enabled(
+                distance=self._distance,
+                prefix=self._prefix,
+                transposition_cost_one=self._transposition_cost_one,
+            )
+            and self._const is not None
+        ):
             # pdb.fuzzy has no direct cast to pdb.const; bridge via pdb.query.
             rendered = f"{rendered}::pdb.query"
         if self._tokenizer is not None:
@@ -1147,9 +1169,7 @@ BigAutoField.register_lookup(ParadeDBExact)
 UUIDField.register_lookup(ParadeDBExact)
 
 __all__ = [
-    "PQ",
     "All",
-    "Fuzzy",
     "Match",
     "MoreLikeThis",
     "ParadeDB",

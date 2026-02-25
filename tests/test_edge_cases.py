@@ -14,8 +14,6 @@ from django.db.models import Value
 from paradedb.functions import Score, Snippet, SnippetPositions, Snippets
 from paradedb.indexes import BM25Index
 from paradedb.search import (
-    PQ,
-    Fuzzy,
     Match,
     MoreLikeThis,
     ParadeDB,
@@ -107,13 +105,6 @@ class TestParadeDBValidation:
         with pytest.raises(ValueError, match="requires at least one"):
             ParadeDB()
 
-    def test_pq_must_be_sole_input(self) -> None:
-        """PQ mixed with other terms raises ValueError on SQL generation."""
-        pdb = ParadeDB(PQ("a") | PQ("b"), Phrase("extra"))
-        queryset = Product.objects.filter(description=pdb)
-        with pytest.raises(ValueError, match="sole ParadeDB input"):
-            str(queryset.query)
-
     def test_parse_must_be_single(self) -> None:
         """Multiple Parse objects raise ValueError on SQL generation."""
         pdb = ParadeDB(Parse("a"), Parse("b"))
@@ -183,25 +174,50 @@ class TestDistanceValidation:
 
     def test_match_default_distance(self) -> None:
         match = Match("test", operator="AND")
-        assert match.fuzzy is None
+        assert match.distance is None
 
     def test_match_distance_zero_is_valid(self) -> None:
-        match = Match("test", operator="AND", fuzzy=Fuzzy(distance=0))
-        assert match.fuzzy is not None
-        assert match.fuzzy.distance == 0
+        match = Match("test", operator="AND", distance=0)
+        assert match.distance == 0
 
     def test_match_negative_distance_raises(self) -> None:
         with pytest.raises(ValueError, match="between 0 and 2, inclusive"):
-            Match("test", operator="AND", fuzzy=Fuzzy(distance=-1))
+            Match("test", operator="AND", distance=-1)
 
     def test_match_large_distance_raises(self) -> None:
         with pytest.raises(ValueError, match="between 0 and 2, inclusive"):
-            Match("test", operator="AND", fuzzy=Fuzzy(distance=10))
+            Match("test", operator="AND", distance=10)
 
     def test_term_distance_validation(self) -> None:
-        term = Term("test", fuzzy=Fuzzy(distance=1))
-        assert term.fuzzy is not None
-        assert term.fuzzy.distance == 1
+        term = Term("test", distance=1)
+        assert term.distance == 1
+
+    def test_match_tokenizer_and_fuzzy_options_allowed(self) -> None:
+        match = Match("test", operator="AND", tokenizer="whitespace", distance=1)
+        assert match.tokenizer == "whitespace"
+        assert match.distance == 1
+
+    def test_match_multi_term_fuzzy_with_boost_allowed(self) -> None:
+        match = Match("a", "b", operator="OR", distance=1, boost=2.0)
+        assert match.boost == 2.0
+        assert match.distance == 1
+
+    def test_match_multi_term_fuzzy_with_const_allowed(self) -> None:
+        match = Match("a", "b", operator="OR", distance=1, const=1.0)
+        assert match.const == 1.0
+        assert match.distance == 1
+
+    def test_term_non_string_rejected(self) -> None:
+        with pytest.raises(TypeError, match="Term text must be a string"):
+            Term(123)  # type: ignore[arg-type]
+
+    def test_match_non_string_terms_rejected(self) -> None:
+        with pytest.raises(TypeError, match="Match terms must be strings"):
+            Match("ok", 123, operator="AND")  # type: ignore[arg-type]
+
+    def test_match_non_string_tokenizer_rejected(self) -> None:
+        with pytest.raises(TypeError, match="Match tokenizer must be a string"):
+            Match("ok", operator="AND", tokenizer=123)  # type: ignore[arg-type]
 
 
 class TestExpressionValidation:
@@ -263,40 +279,6 @@ class TestExpressionValidation:
         )
         assert proximity_array.boost == 1.0
         assert proximity_array.const == 1.0
-
-
-class TestPQValidation:
-    """Test PQ object validation and operations."""
-
-    def test_pq_combine_with_non_pq_raises(self) -> None:
-        """Combining PQ with non-PQ raises TypeError."""
-        pq = PQ("test")
-        with pytest.raises(TypeError, match="PQ instances"):
-            pq | "string"  # type: ignore[operator]
-
-    def test_pq_mixed_operators_raises(self) -> None:
-        """Mixing AND and OR operators raises ValueError."""
-        pq_or = PQ("a") | PQ("b")
-        with pytest.raises(ValueError, match="Mixed PQ operators"):
-            pq_or & PQ("c")
-
-    def test_pq_single_term_no_operator(self) -> None:
-        """Single PQ has no operator."""
-        pq = PQ("test")
-        assert pq.operator is None
-        assert pq.terms == ("test",)
-
-    def test_pq_chained_or(self) -> None:
-        """Chained OR preserves all terms."""
-        pq = PQ("a") | PQ("b") | PQ("c") | PQ("d")
-        assert pq.terms == ("a", "b", "c", "d")
-        assert pq.operator == "OR"
-
-    def test_pq_chained_and(self) -> None:
-        """Chained AND preserves all terms."""
-        pq = PQ("a") & PQ("b") & PQ("c")
-        assert pq.terms == ("a", "b", "c")
-        assert pq.operator == "AND"
 
 
 class TestMoreLikeThisValidation:
@@ -552,7 +534,7 @@ class TestEmptyAndWhitespaceInputs:
     def test_match_distance_empty_string(self) -> None:
         """Match with distance and empty string works."""
         queryset = Product.objects.filter(
-            description=ParadeDB(Match("", operator="OR", fuzzy=Fuzzy(distance=1)))
+            description=ParadeDB(Match("", operator="OR", distance=1))
         )
         sql = str(queryset.query)
         assert "''::pdb.fuzzy" in sql
@@ -572,10 +554,11 @@ class TestLongInputs:
 
     def test_many_or_terms(self) -> None:
         """Many OR terms work."""
-        pq = PQ("term1")
-        for i in range(2, 101):
-            pq = pq | PQ(f"term{i}")
-        queryset = Product.objects.filter(description=ParadeDB(pq))
+        queryset = Product.objects.filter(
+            description=ParadeDB(
+                Match(*[f"term{i}" for i in range(1, 101)], operator="OR")
+            )
+        )
         sql = str(queryset.query)
         assert "term100" in sql
         assert "|||" in sql
