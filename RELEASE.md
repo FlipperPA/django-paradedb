@@ -60,13 +60,9 @@ Use this format:
 
 ## Testing and CI Expectations
 
-CI should cover the published support matrix:
+CI should cover the published support matrix.
 
-- Django: current LTS and previous LTS.
-- ParadeDB: latest minor and previous minor.
-- Postgres: ParadeDB-supported versions.
-
-Optional non-blocking jobs may include ParadeDB nightly or pre-release builds.
+The source of truth is the matrix in `.github/workflows/ci.yml`. When compatibility changes, update that matrix first and keep `README.md` in sync in the same PR.
 
 ## Decisions for ParadeDB 1.0
 
