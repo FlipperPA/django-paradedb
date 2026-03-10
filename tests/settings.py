@@ -15,3 +15,4 @@ DATABASES = {"default": database_settings()}
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 SECRET_KEY = "tests-secret-key"
 MIGRATION_MODULES = {"tests": None}
+ALLOWED_HOSTS = ["*"]
