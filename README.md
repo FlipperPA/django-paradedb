@@ -284,6 +284,10 @@ CREATE DATABASE paradedb_test WITH OWNER paradedb_test_user;
 \c paradedb_test
 CREATE EXTENSION pg_search;
 CALL paradedb.create_bm25_test_table(schema_name=>'public', table_name=>'mock_items');
+ALTER TABLE public.mock_items OWNER TO paradedb_test_user;
+CREATE INDEX mock_items_bm25 ON public.mock_items
+    USING bm25 (id, description, category, rating, in_stock, metadata)
+    WITH (key_field='id');
 ```
 
 Then run migrations and start Django's `runserver`:
